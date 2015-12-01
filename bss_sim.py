@@ -5,7 +5,7 @@ import socket
 import logging 
 import binascii
 
-# credits for CRC24 go to https://github.com/toofishes/python-pgpdump/blob/master/pgpdump/utils.py
+# CRC code inspired by vGSN (UnifyCore)
 
 CRC24_TABLE = (
 	0x00000000, 0x00d6a776, 0x00f64557, 0x0020e221, 0x00b78115, 0x00612663, 0x0041c442, 0x00976334,
@@ -167,9 +167,20 @@ while 1:
 		s.sendto(hex_msg, (peer_IP, remote_port))
 		
 		#when we are attached, we can activate a PDP context :)	
-		
-	
+		msg = "0000000201"
+		msg += binascii.hexlify(new_ptmsi)
+		msg += "000004088809f107000100000000800e0044"
+		llc_header = "01c0110a4105030c00001f000000000000000000020121280908696e7465726e6574271d80c0230601000006000080211001000010810600000000830600000000"		
+		msg += llc_header
+		llc_crc = crc24(bytearray(llc_header.decode('hex')))
+		hex_msg = msg.decode('hex')
+		hex_msg += llc_crc.decode('hex')
+		s.sendto(hex_msg, (peer_IP, remote_port))
+
 	else:
 		logging.info('Message not implemented: %s' % hex_bytes)
 
-
+# aby sme sa zbavili tychto hlupych zavislosti, napiseme si funkcie posielajuce jednotlive spravy,
+# spravime bootstrap GPRS_NS a BSSGP a zvysne procedury budeme iniciovat rucne prikazmi z CLI
+# ktore bude obsluhovat samostatny thread...pre procedury sa vytvoria automaty podobne ako teraz
+# a stale vyvolame postupnost sprav podla nasich potrieb, treba uz len odsniffovat mozne scenare
