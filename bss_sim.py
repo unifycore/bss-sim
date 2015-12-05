@@ -42,6 +42,7 @@ CRC24_TABLE = (
         0x00dafe19, 0x000c596f, 0x002cbb4e, 0x00fa1c38, 0x006d7f0c, 0x00bbd87a, 0x009b3a5b, 0x004d9d2d
 )
 
+# computes LLC 24bit checksum 
 def crc24(data):
 	INIT = 0xFFFFFF
 	crc = INIT
@@ -60,7 +61,7 @@ peer_IP = "192.168.27.2"
 local_port = 22000
 remote_port = 23000
 new_ptmsi = ''
-
+attach_type = ''
 ###########################
 # Gb protocols' states
 
@@ -129,28 +130,50 @@ while 1:
 	elif data[0] == '\x00' and data[4] == '\x25':
 		logging.info('Received BSSGP UNBLOCK_ACK packet from vGSN: %s' % hex_bytes)
 		logging.info('sending ATTACH REQUEST')
-		msg = "00000002019428c68b000004088809f107000100000000800e002e01c001080102e5e001070405f4d428c68b32f110000a001119134233572bf7c84802134850c84802001716f0f403"
+		#attach with old P-TSMI	
+		#msg = "00000002019428c68b000004088809f107000100000000800e002e01c001080102e5e001070405f4d428c68b32f110000a001119134233572bf7c84802134850c84802001716f0f403"
+		#attach with IMSI
+		attach_type = 'imsi'
+		msg = "00000002019428c68b000004088809f107000100000000800e003101c001080102e5e001070408291310443582351132f110000a001119134233572bf7c84802134850c84802001716"
 		hex_msg = msg.decode('hex')
+		llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+		hex_msg += llc_crc.decode('hex')
 		s.sendto(hex_msg, (peer_IP, remote_port))
 	
 	#if we attach with an unknown P-TMSI and receive an Identity Request, we respond with an Identity Response
-	elif data[0] == '\x00' and len(data) > 46 and data[45] == '\x15':
+	elif data[0] == '\x00'  and len(data) > 46 and data[45] == '\x15':
 		logging.info('Received GMM Identity Request packet from vGSN: %s' % hex_bytes)
 		
-		#if IMEI is requested
-		if data[46] == '\x02':	
-			logging.info('Sending Identity Response with IMEI')
-			msg = "00000002019428c68b000004088809f107000100000000800e001101c0050816083a85030013404403742073"
-			hex_msg = msg.decode('hex')
-			s.sendto(hex_msg, (peer_IP, remote_port))
-	
-		#if IMSI is requested
-		if data[46] == '\x01':
-			logging.info('Sending Identity Response with IMSI')
-			msg = "00000002019428c68b000004088809f107000100000000800e001101c00908160829131044358235116a4ec7"
-			hex_msg = msg.decode('hex')
-			s.sendto(hex_msg, (peer_IP, remote_port))
+		if attach_type == 'imsi':
+			print 'nay'
 
+		if attach_type == 'ptmsi':
+		
+			#if IMEI is requested
+			if data[46] == '\x02':	
+				logging.info('Sending Identity Response with IMEI')
+				msg = "00000002019428c68b000004088809f107000100000000800e001101c0050816083a85030013404403742073"
+				hex_msg = msg.decode('hex')
+				s.sendto(hex_msg, (peer_IP, remote_port))
+	
+			#if IMSI is requested
+			if data[46] == '\x01':
+				logging.info('Sending Identity Response with IMSI')
+				msg = "00000002019428c68b000004088809f107000100000000800e001101c00908160829131044358235116a4ec7"
+				hex_msg = msg.decode('hex')
+				s.sendto(hex_msg, (peer_IP, remote_port))
+
+	#if we receive an Identity request after an IMSI attach
+	elif data[0] == '\x00' and len(data) > 55 and data[55] == '\x15':
+		
+		#if IMEI is requested
+		if data[56] == '\x02':
+			logging.info('Sending Identity Response with IMEI')
+                        msg = "00000002019428c68b000004088809f107000100000000800e001101c0050816083a85030013404403"
+			hex_msg = msg.decode('hex')
+                        llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+			hex_msg += llc_crc.decode('hex')
+			s.sendto(hex_msg, (peer_IP, remote_port))
 	#if we receive an Attach Accept, we respond with an Attach Complete message
 	elif data[0] == '\x00' and len(data) > 72 and data[55] == '\x02':
 		logging.info('Received GMM Attach Accept packet from vGSN: %s' % hex_bytes)
