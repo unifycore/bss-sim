@@ -1,12 +1,24 @@
 #!/usr/bin/python
 
-import sys
+#import sys
 import socket
 import logging 
 import binascii
+import threading
+from time import sleep
+
+# flips bute values/changes endianness
+def host_to_network_order(host):
+    bytes_host = bytearray(host)
+    
+    for i in range (0, len(bytes_host), 2):
+	tmp = bytes_host[i]
+	bytes_host[i] = bytes_host[i+1]
+	bytes_host[i+1] = tmp
+
+    return bytes_host
 
 # CRC code inspired by vGSN (UnifyCore)
-
 CRC24_TABLE = (
 	0x00000000, 0x00d6a776, 0x00f64557, 0x0020e221, 0x00b78115, 0x00612663, 0x0041c442, 0x00976334,
         0x00340991, 0x00e2aee7, 0x00c24cc6, 0x0014ebb0, 0x00838884, 0x00552ff2, 0x0075cdd3, 0x00a36aa5,
@@ -54,156 +66,318 @@ def crc24(data):
 	res = hex_crc[6:] + hex_crc[4:6] + hex_crc[2:4]
 	return res 
 
+#to compute the checksum, the CRC in IP header supplied should be ommitted or set to 0000
+#checksum code taken from http://stackoverflow.com/questions/1767910/checksum-udp-calculation-python
+def calc_ip_checksum(msg):
+    s = 0
+    msg = msg.decode('hex')
+    for i in range(0, len(msg), 2):
+        b = ord(msg[i]) + (ord(msg[i+1]) << 8)
+        tmp = s + b
+        s = (tmp & 0xffff) + (tmp >> 16)
+    s = str(hex(~s & 0xffff))
+    return s[4:] + s[2:4]
+
+#sends message to vGSN
+def send_message(socket, message, ip, port, msg_text, net):
+	print 'Sending %s packet to %s network' % (msg_text, net) 
+	logging.info('Sending %s packet to %s network' % (msg_text, net))
+	logging.info('Msg bytes: %s' % message)
+	message = message.decode('hex')
+	socket.sendto(message, (ip, port))
+
+def connect_to_core(sock, ip, port, core):
+	
+	###########################
+	# Gb protocols' states
+	NS_BLOCKED = 1
+	NS_UNBLOCKED = 0
+	###########################
+	
+	#send initial message - NS_RESET	
+	send_message(sock, "020081010182006504820065000000000000", ip, port, 'initial NS_RESET message', core)
+
+	#receive
+	while 1:
+		data, addr = sock.recvfrom(2048)	
+		hex_bytes =  binascii.hexlify(data)
+	
+		#if we receive a NS_ALIVE message, we reply with NS_ALIVE_ACK
+		if data[0] == '\x0a':
+			print 'Received NS_ALIVE packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received NS_ALIVE packet from vGSN in %s network: %s' % (core, hex_bytes))
+			send_message(sock, '0b', ip, port, 'NS_ALIVE_ACK', core)
+	
+		#if we receive a NS_RESET_ACK message and are in NS_BLOCKED state, we send a NS_UNBLOCK message
+		elif data[0] == '\x03' and NS_BLOCKED:
+			print 'Received NS_RESET_ACK packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received NS_RESET_ACK packet from vGSN in %s network: %s' % (core, hex_bytes))
+			send_message(sock, '06', ip, port, 'NS_UNBLOCK', core)
+	
+		#if we receive a NS_UNBLOCK_ACK, we move to unblocked state and send a BVC_RESET
+		elif data[0] == '\x07':
+			print 'Received NS_UNBLOCK_ACK packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received NS_UNBLOCK_ACK packet from vGSN in %s network: %s' % (core, hex_bytes))
+			NS_BLOCKED = 0
+			NS_UNBLOCKED = 1 
+			send_message(sock, "000000002204820000078108088809f1070001000000", ip, port, 'BVC_RESET', core)		
+	
+		#if we reset BVCI 0, we need to reset BVCI 2
+		elif data[0] == '\x00' and data[4] == '\x23':
+			print 'Received BVC_RESET_ACK packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received BVC_RESET_ACK packet from vGSN in %s network: %s' % (core, hex_bytes))
+		
+			#we reset BVCI 0, time to reset BVCI 2                
+			if data[7] == '\x00' and data[8] == '\x00' :
+				send_message(sock, "000000002204820002078108088809f1070001000000", ip, port, 'BVC_RESET', core)	
+		
+			#if we reset BVCI 2, time to unblock BSSGP BVCI 2
+			if data[7] == '\x00' and data[8] == '\x02':
+				send_message(sock, "000000002404820002", ip, port, 'BVC_UNBLOCK', core)	
+	
+		#if we receive a UNBLOCK-ACK message, we might begin with FLOW_CONTROL, but...we are ready for ATTACH!!!
+		elif data[0] == '\x00' and data[4] == '\x25':
+			print 'Received BSSGP UNBLOCK_ACK packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received BSSGP UNBLOCK_ACK packet from vGSN in %s network: %s' % (core, hex_bytes))
+	
+			#attach with old P-TSMI	
+			#attach_type = 'ptmsi'		   #RAI       #	
+			#msg = "00000002019428c68b0000040888" + rai_with_cell_id 
+			#msg += "00800e002e01c001080102e5e001070405f4" + old_ptmsi + old_rai + "1119134233572bf7c84802134850c84802001716f0f403"
+	
+			#attach with IMSI
+			attach_type = 'imsi'
+			msg = "00000002019428c68b0000040888" + rai_with_cell_id
+			msg += "00800e003101c001080102e5e001070408" + imsi + old_rai + "1119134233572bf7c84802134850c84802001717"
+		
+			llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+			if len(llc_crc) == 5:
+				llc_crc = '0' + llc_crc
+			msg += llc_crc
+			send_message(sock, msg, ip, port, 'ATTACH_REQUEST', core)	
+	
+		#if we attach with an unknown P-TMSI and receive an Identity Request, we respond with an Identity Response
+		elif data[0] == '\x00'  and len(data) > 46 and data[45] == '\x15':
+			print 'Received GMM Identity Request (P-TMSI attach) packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received GMM Identity Request packet from vGSN in %s network: %s' % (core, hex_bytes))
+		
+			if attach_type == 'imsi':
+				print 'nay'
+
+			if attach_type == 'ptmsi':
+		
+				#if IMEI is requested
+				if data[46] == '\x02':	
+					msg = "00000002019428c68b0000040888" + rai_with_cell_id + "00800e001101c0050816083a85030013404403"
+					llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+					if len(llc_crc) == 5:
+						llc_crc = '0' + llc_crc
+					msg += llc_crc
+					send_message(sock, msg, ip, port, 'IDENTITY_RESPONSE with IMEI', core)	
+				
+				#if IMSI is requested
+				if data[46] == '\x01':
+					msg = "00000002019428c68b0000040888" + rai_with_cell_id + "00800e001101c009081608" + imsi
+					llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+					if len(llc_crc) == 5:
+						llc_crc = '0' + llc_crc
+					msg += llc_crc
+					send_message(sock, msg, ip, port, 'IDENTITY_RESPONSE with IMSI', core)
+
+		#if we receive an Identity request after an IMSI attach
+		elif data[0] == '\x00' and len(data) > 55 and data[55] == '\x15':
+			print 'Received GMM Identity Request (IMSI attach) packet from vGSN in %s network: %s' % (core, hex_bytes)
+		
+			#if IMEI is requested
+			if data[56] == '\x02':
+                        	msg = "00000002019428c68b0000040888" + rai_with_cell_id + "00800e001101c0050816083a85030013404403"
+                        	llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+				if len(llc_crc) == 5:
+					llc_crc = '0' + llc_crc
+				msg += llc_crc
+				send_message(sock, msg, ip, port, 'IDENTITY_RESPONSE with IMEI', core)
+	
+		#if we receive an Attach Accept, we respond with an Attach Complete message
+		elif data[0] == '\x00' and len(data) > 72 and data[55] == '\x02':
+			print 'Received GMM Attach Accept packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received GMM Attach Accept packet from vGSN in %s network: %s' % (core, hex_bytes))
+		
+			#new P-TMSI will be used as the new TLLI 
+			new_ptmsi = binascii.hexlify(data[68:72])	
+			msg = "0000000201" + new_ptmsi + "0000040888" + rai_with_cell_id + "00800e000801c00d0803"
+			llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+			if len(llc_crc) == 5:
+				llc_crc = '0' + llc_crc
+			msg += llc_crc
+			send_message(sock, msg, ip, port, 'ATTACH_COMPLETE', core)
+	
+			#when we are attached, we can activate a PDP context :)	
+			msg = "0000000201" +  new_ptmsi + "0000040888" + rai_with_cell_id + "00800e0044"
+			llc_header = "01c0110a4105030c00001f000000000000000000020121280908696e7465726e6574271d80c0230601000006000080211001000010810600000000830600000000"
+			msg += llc_header
+			llc_crc = crc24(bytearray(llc_header.decode('hex')))
+			if len(llc_crc) == 5:
+				llc_crc = '0' + llc_crc
+			msg += llc_crc
+			send_message(sock, msg, ip, port, 'ACTIVATE_PDP_CTX_REQUEST', core)
+	
+		elif data[0] == '\x00' and len(data) > 72 and data[55] == '\x42':
+			print 'Received SM Activate PDP Context Accept packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received SM Activate PDP Context Accept packet from vGSN in %s network: %s' % (core, hex_bytes))
+			client_ip = data[77:81]
+			print "Client's IP is: %s" % socket.inet_ntoa(client_ip)	
+			client_ip = binascii.hexlify(client_ip)
+				
+			#send ICMP echo
+			msg = "0000000201" + new_ptmsi + "0000040888" + rai_with_cell_id + "00800e005e" 
+			ip_header = "45000054c14900004001" + client_ip + "08080808"
+			ip_crc = calc_ip_checksum(ip_header)
+			ip_header = ip_header[:20] + ip_crc + ip_header[20:] 
+			icmp_header = "0800a4ac6c060000574213b50000915208090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637"
+			llc_header = "03c00165000000" +  ip_header + icmp_header 
+			msg += llc_header		
+			llc_crc = crc24(bytearray(llc_header.decode('hex')))
+			if len(llc_crc) == 5:
+				llc_crc = '0' + llc_crc
+			msg += llc_crc
+			send_message(sock, msg, ip, port, 'PING 8.8.8.8', core)
+
+			#deactivate PDP context
+			msg = "0000000201" + new_ptmsi + "0000040888" + rai_with_cell_id + "00800e000901c0150a4624"
+			llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+			if len(llc_crc) == 5:
+				llc_crc = '0' + llc_crc
+			msg += llc_crc
+			send_message(sock, msg, ip, port, 'DEACTIVATE PDP CTX REQUEST', core)
+
+		elif data[0] == '\x00' and len(data) > 55 and  data[55] == '\x47':	
+			print 'Received SM Deactivate PDP Context Accept packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received SM Deactivate PDP Context Accept packet from vGSN in %s network: %s' % (core, hex_bytes))
+
+			msg = "0000000201" + new_ptmsi + "0000040888" + rai_with_cell_id + "00800e001001c0190805011805f4" + new_ptmsi
+			llc_crc = crc24(bytearray(msg[54:].decode('hex')))
+			if len(llc_crc) == 5:
+				llc_crc = '0' + llc_crc
+			msg += llc_crc
+			send_message(sock, msg, ip, port, 'DETACH REQUEST', core)
+	
+		elif data[0] == '\x00' and len(data) > 55 and data[55] == '\x06':
+			print 'Received GMM Detach Accept packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received GMM Detach Accept packet from vGSN in %s network: %s' % (core, hex_bytes))
+		
+		elif data[0] == '\x00' and data[26] == '\x04':
+			print 'Received GMM Attach Reject packet from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received GMM Attach Reject packet from vGSN in %s network: %s' % (core, hex_bytes))
+
+		elif data[0] == '\x00' and len(data) > 55 and  data[55] == '\x43':
+			print 'Received SM Activate PDP Context Reject packet from vGSN in %s network: %s' %m (core, hex_bytes)
+			logging.info('Received SM Activate PDP Context Reject packet from vGSN in %s network: %s' % (core, hex_bytes))
+	
+		#XXX verify when connected to the Internet	
+		#check what MAC address puts the controller in the frame
+		elif data[0] == '\x00' and len(data) > 110 and  data[61] == '\x00':
+			print 'Received ICMP Echo Reply packet from 8.8.8.8 via %s network: %s' % (core, hex_bytes)
+			logging.info('Received ICMP Echo Reply packet from 8.8.8.8 via %s network: %s' % (core, hex_bytes))
+		
+			sleep(1)	
+			#send ICMP echo
+			msg = "0000000201" + new_ptmsi + "0000040888" + rai_with_cell_id + "00800e005e" 
+			ip_header = "45000054c14900004001" + client_ip + "08080808"
+			ip_crc = calc_ip_checksum(ip_header)
+			ip_header = ip_header[:20] + ip_crc + ip_header[20:] 
+			icmp_header = "0800a4ac6c060000574213b50000915208090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637"
+			llc_header = "03c00165000000" +  ip_header + icmp_header 
+			msg += llc_header		
+			llc_crc = crc24(bytearray(llc_header.decode('hex')))
+			if len(llc_crc) == 5:
+				llc_crc = '0' + llc_crc
+			msg += llc_crc
+			send_message(sock, msg, ip, port, 'PING 8.8.8.8', core)
+		
+		else:
+			print 'Received an unknown message from vGSN in %s network: %s' % (core, hex_bytes)
+			logging.info('Received an unknown message from vGSN in %s network: %s' % (core, hex_bytes))
+
+
+"""
+#ask user what he wants
+action = raw_input('Welcome to the Unifycore BSS simulator!\nTo attach, press A...to exit, press E:\n')
+while 1:
+    if action == 'E' or action == 'e':
+	print "Exiting the BSS simulator. Goodbye!"
+	exit()
+    elif action == 'A' or action == 'a':
+    	a_t = raw_input('To attach with IMSI press I, to attach with P-TMSI, press P:\n')
+	while 1:
+	    if a_t == 'I' or a_t == 'i':
+	    	attach_type = 'imsi'
+	        imsi = raw_input('Press 1 to select IMSI 231019876543210\nPress 2 to select IMSI 901702132435465\nPress n or N to enter the IMSI: ')
+		break
+	    elif a_t == 'P' or a_t == 'p':
+	    	attach_type = 'ptmsi'
+		ptmsi = raw_input('Enter the P-TMSI: ')
+		break
+	    else:
+	    	a_t = raw_input('Wrong key pressed.\nTo attach with IMSI press I, to attach with P-TMSI, press P:\n')
+    	break
+    else:
+	action = raw_input('Wrong key pressed.\nTo attach, press A...to exit, press E:\n')
+core = raw_input('Select network core to which you want to attach. Press 1 for MCC/MNC 90170 or press 2 for MCC/MNC 23101: \n')
+core = int(core)
+while 1:
+    if core == 1:
+        rai = '901-70-1-0'
+	break
+    elif core == 2:
+        rai = '231-01-1-0'
+	break
+    else:
+	core = raw_input('Select network core to which you want to attach. Press 1 for MCC/MNC 90170 or press 2 for MCC/MNC 23101: \n')
+
+
+#XXX continue here, print a list of IMSIs or read new one from the CLI:
+#imsi = '\x29\x13\x10\x44\x35\x82\x35\x11'
+#>>> hi = binascii.hexlify(imsi)
+#>>> print hi
+#2913104435823511
+
+"""
+
 ############################
 # IP and port configuration
-
+#XXX add 2 vGSN support
 peer_IP = "192.168.27.2"
 local_port = 22000
 remote_port = 23000
 new_ptmsi = ''
+old_ptmsi = 'd428c68b'
 attach_type = ''
-###########################
-# Gb protocols' states
+rai_with_cell_id = '32f110000a000000'
+old_rai = '32f110000a00'
+client_ip = ''
+#imsi has to start with 9 indicating its odd length
+imsi = host_to_network_order('9231011234567890')
 
-NS_BLOCKED = 1
-NS_UNBLOCKED = 0
-
-###########################
 logging.basicConfig(filename='/tmp/bss_sim.log', level=logging.DEBUG);
 
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+#s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 logging.info('Socket created')
 
 #bind the socket to predefined port
-s.bind(("", local_port))
-logging.info('Ready to receive')
+s1.bind(("192.168.25.1", local_port))
+#s2.bind(('', local_port+1))
+logging.info('Socket open. Ready to receive.')
 
-#receive
+#connect_to_core(s1, peer_IP, remote_port)
+
+thread = threading.Thread(target=connect_to_core, args = [s1,peer_IP,remote_port, '23101'])
+thread.daemon = True
+thread.start()
+
+while True:
+    exit_signal = raw_input('Type "exit" anytime to stop server\n')
+    if exit_signal == 'exit':
+        break
 
 
-#send initial message - NS_RESET	
-msg = "020081010182006504820065000000000000" 
-byte_msg = msg.decode('hex')
-s.sendto(byte_msg, (peer_IP, remote_port))
-
-while 1:
-	data, addr = s.recvfrom(2048)	
-	hex_bytes =  binascii.hexlify(data)
-	print hex_bytes	
-	
-	#if we receive a NS_ALIVE message, we reply with NS_ALIVE_ACK
-	if data[0] == '\x0a':
-		s.sendto('\x0b', (peer_IP, remote_port))	
-		logging.info('Received NS_ALIVE packet from vGSN: %s' % hex_bytes)
-	
-	#if we receive a NS_RESET_ACK message and are in NS_BLOCKED state, we send a NS_UNBLOCK message
-	elif data[0] == '\x03' and NS_BLOCKED:
-		s.sendto('\x06', (peer_IP, remote_port))
-		logging.info('Received NS_RESET_ACK packet from vGSN: %s' % hex_bytes)
-
-	#if we receive a NS_UNBLOCK_ACK, we move to unblocked state and send a BVC_RESET
-	elif data[0] == '\x07':
-		logging.info('Received NS_UNBLOCK_ACK packet from vGSN: %s' % hex_bytes)
-		NS_BLOCKED = 0
-		NS_UNBLOCKED = 1 
-		msg = "000000002204820000078108088809f1070001000000" 
-		hex_msg = msg.decode('hex')	
-		s.sendto(hex_msg, (peer_IP, remote_port))
-	
-	#if we reset BVCI 0, we need to reset BVCI 2
-	elif data[0] == '\x00' and data[4] == '\x23':
-		logging.info('Received BVC_RESET_ACK packet from vGSN: %s' % hex_bytes)
-		
-		#we reset BVCI 0, time to reset BVCI 2                
-		if data[7] == '\x00' and data[8] == '\x00' :
-			msg = "000000002204820002078108088809f1070001000000"
-                	hex_msg = msg.decode('hex')
-                	s.sendto(hex_msg, (peer_IP, remote_port))
-		
-		#if we reset BVCI 2, time to unblock BSSGP BVCI 2
-		if data[7] == '\x00' and data[8] == '\x02':
- 			msg = "000000002404820002"
-			hex_msg = msg.decode('hex')
-			s.sendto(hex_msg, (peer_IP, remote_port))
-	
-	#if we receive a UNBLOCK-ACK message, we might begin with FLOW_CONTROL, but...we are ready for ATTACH!!!
-	elif data[0] == '\x00' and data[4] == '\x25':
-		logging.info('Received BSSGP UNBLOCK_ACK packet from vGSN: %s' % hex_bytes)
-		logging.info('sending ATTACH REQUEST')
-		#attach with old P-TSMI	
-		#msg = "00000002019428c68b000004088809f107000100000000800e002e01c001080102e5e001070405f4d428c68b32f110000a001119134233572bf7c84802134850c84802001716f0f403"
-		#attach with IMSI
-		attach_type = 'imsi'
-		msg = "00000002019428c68b000004088809f107000100000000800e003101c001080102e5e001070408291310443582351132f110000a001119134233572bf7c84802134850c84802001716"
-		hex_msg = msg.decode('hex')
-		llc_crc = crc24(bytearray(msg[54:].decode('hex')))
-		hex_msg += llc_crc.decode('hex')
-		s.sendto(hex_msg, (peer_IP, remote_port))
-	
-	#if we attach with an unknown P-TMSI and receive an Identity Request, we respond with an Identity Response
-	elif data[0] == '\x00'  and len(data) > 46 and data[45] == '\x15':
-		logging.info('Received GMM Identity Request packet from vGSN: %s' % hex_bytes)
-		
-		if attach_type == 'imsi':
-			print 'nay'
-
-		if attach_type == 'ptmsi':
-		
-			#if IMEI is requested
-			if data[46] == '\x02':	
-				logging.info('Sending Identity Response with IMEI')
-				msg = "00000002019428c68b000004088809f107000100000000800e001101c0050816083a85030013404403742073"
-				hex_msg = msg.decode('hex')
-				s.sendto(hex_msg, (peer_IP, remote_port))
-	
-			#if IMSI is requested
-			if data[46] == '\x01':
-				logging.info('Sending Identity Response with IMSI')
-				msg = "00000002019428c68b000004088809f107000100000000800e001101c00908160829131044358235116a4ec7"
-				hex_msg = msg.decode('hex')
-				s.sendto(hex_msg, (peer_IP, remote_port))
-
-	#if we receive an Identity request after an IMSI attach
-	elif data[0] == '\x00' and len(data) > 55 and data[55] == '\x15':
-		
-		#if IMEI is requested
-		if data[56] == '\x02':
-			logging.info('Sending Identity Response with IMEI')
-                        msg = "00000002019428c68b000004088809f107000100000000800e001101c0050816083a85030013404403"
-			hex_msg = msg.decode('hex')
-                        llc_crc = crc24(bytearray(msg[54:].decode('hex')))
-			hex_msg += llc_crc.decode('hex')
-			s.sendto(hex_msg, (peer_IP, remote_port))
-	#if we receive an Attach Accept, we respond with an Attach Complete message
-	elif data[0] == '\x00' and len(data) > 72 and data[55] == '\x02':
-		logging.info('Received GMM Attach Accept packet from vGSN: %s' % hex_bytes)
-		
-		#new P-TMSI will be used as a new TLLI 
-		new_ptmsi = data[68:72]	
-		logging.info('Sending Attach Complete')
-		msg = "0000000201" 
-		msg += binascii.hexlify(new_ptmsi)
-		msg += "000004088809f107000100000000800e000801c00d0803"
-		llc_crc = crc24(bytearray(msg[54:].decode('hex')))
-		hex_msg = msg.decode('hex')
-		hex_msg += llc_crc.decode('hex')
-		s.sendto(hex_msg, (peer_IP, remote_port))
-		
-		#when we are attached, we can activate a PDP context :)	
-		msg = "0000000201"
-		msg += binascii.hexlify(new_ptmsi)
-		msg += "000004088809f107000100000000800e0044"
-		llc_header = "01c0110a4105030c00001f000000000000000000020121280908696e7465726e6574271d80c0230601000006000080211001000010810600000000830600000000"		
-		msg += llc_header
-		llc_crc = crc24(bytearray(llc_header.decode('hex')))
-		hex_msg = msg.decode('hex')
-		hex_msg += llc_crc.decode('hex')
-		s.sendto(hex_msg, (peer_IP, remote_port))
-
-	else:
-		logging.info('Message not implemented: %s' % hex_bytes)
-
-# aby sme sa zbavili tychto hlupych zavislosti, napiseme si funkcie posielajuce jednotlive spravy,
-# spravime bootstrap GPRS_NS a BSSGP a zvysne procedury budeme iniciovat rucne prikazmi z CLI
-# ktore bude obsluhovat samostatny thread...pre procedury sa vytvoria automaty podobne ako teraz
-# a stale vyvolame postupnost sprav podla nasich potrieb, treba uz len odsniffovat mozne scenare
