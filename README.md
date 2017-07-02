@@ -27,7 +27,10 @@ Static BSS simulator for GMM testing (does not replace a normal BSS, messages ar
                                  |  $$$$$$/
                                   \______/
 
+
 UnifyCore project developed on FIIT STU (Faculty of informatics and information technologies, Slovak university of technology in Bratislava). Unifycore is a simplistic SDN based GPRS network architecture.
+
+
 SUPPORT
 --------
 
